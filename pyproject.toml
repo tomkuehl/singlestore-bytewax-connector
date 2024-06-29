@@ -1,0 +1,51 @@
+[project]
+name = "singlestore-bytewax-connector"
+version = "0.0.1"
+description = "A Bytewax connector for SingleStore"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {file = "LICENSE.txt"}
+keywords = ["bytewax", "streaming", "connector", "singlestore"]
+authors = [
+  {name = "Tom Kühl", email = "hello@tomkuehl.io" }
+]
+maintainers = [
+  {name = "Tom Kühl", email = "hello@tomkuehl.io" }
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.7",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = [
+  "bytewax==0.20.1",
+  "mysqlclient==2.2.4"
+]
+[project.optional-dependencies]
+dev = [
+    "check-manifest==0.49",
+    "black==23.3.0",
+    "pre-commit>=2.19.0",
+    "pytest==7.4.0",
+    "tox==4.6.3",
+    "sphinx<7",
+    "sphinx-rtd-theme"
+]
+[project.urls]
+"Homepage" = "https://github.com/tomkuehl/singlestore-bytewax-connector"
+"Bug Reports" = "https://github.com/tomkuehl/singlestore-bytewax-connector/issues"
+"Source" = "https://github.com/tomkuehl/singlestore-bytewax-connector/"
+[build-system]
+requires = ["setuptools>=43.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+[tool.pytest.ini_options]
+pythonpath = [
+  "src"
+]
