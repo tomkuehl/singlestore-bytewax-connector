@@ -81,7 +81,6 @@ class _SingleStoreSourcePartition(
     def close(self):
         self.connection.close()
         self.cursor.close()
-        print("CLOSING")
 
     def _start_observe_query(self):
         connection = MySQLdb.connect(**self.connection_params)
