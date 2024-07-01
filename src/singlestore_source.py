@@ -74,11 +74,12 @@ class _SingleStoreSourcePartition(
         self.connection_params = connection_params
         self.table = table
         self.event_types = event_types
+        self.loop = asyncio.new_event_loop()
         self.last_offsets = {
             i: resume_state[i] if resume_state and i in resume_state else None
-            for i in range(asyncio.run(self._get_partition_count()))
+            for i in range(self.loop.run_until_complete(self._get_partition_count()))
         }
-        self.loop = asyncio.new_event_loop()
+        self.columns = self.loop.run_until_complete(self._describe_table())
         self.batcher = batch_async(
             self._observe(),
             timeout=batch_timeout,
@@ -126,7 +127,13 @@ class _SingleStoreSourcePartition(
             row = await self.cursor.fetchone()
             self.last_offsets[row[1]] = row[0]
             if row[2] in self.event_types:
-                yield {"type": row[2], "data": row[7:]}
+                data = row[7:]
+                yield {
+                    "type": row[2],
+                    "data": {
+                        self.columns[i]["name"]: data[i] for i in range(len(data))
+                    },
+                }
 
     def _stringify_offsets(self):
         ordered_offsets = sorted(self.last_offsets.items(), key=lambda x: x[0])
@@ -141,3 +148,13 @@ class _SingleStoreSourcePartition(
                 await cursor.execute("SHOW PARTITIONS")
                 partitions = await cursor.fetchall()
                 return len(partitions) if partitions is not None else 1
+
+    async def _describe_table(self):
+        async with connect(**self.connection_params) as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute(f"DESCRIBE {self.table}")
+                result = await cursor.fetchall()
+                return [
+                    {"name": row[0], "is_primary_key": row[3] == "PRI"}
+                    for row in result
+                ]
