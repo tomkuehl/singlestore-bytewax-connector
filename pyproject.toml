@@ -26,7 +26,8 @@ classifiers = [
 ]
 dependencies = [
   "bytewax==0.20.1",
-  "mysqlclient==2.2.4"
+  "asyncmy==0.2.9",
+  "asyncio==3.4.3"
 ]
 [project.optional-dependencies]
 dev = [
