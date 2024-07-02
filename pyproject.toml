@@ -36,7 +36,7 @@ dev = [
     "pre-commit>=2.19.0",
     "pytest==8.2.2",
     "tox==4.15.1",
-    "sphinx<7",
+    "sphinx<8",
     "sphinx-rtd-theme"
 ]
 [project.urls]
