@@ -5,9 +5,26 @@ from asyncmy import connect
 from asyncmy.cursors import SSCursor
 from datetime import timedelta
 import asyncio
+from prometheus_client import Gauge
 
 
-class SingleStoreSource(FixedPartitionedSource[dict, dict[int, Optional[bytes]]]):
+OFFSET_LAG_GAUGE = Gauge(
+    "singlestore_partition_offset_lag",
+    "The number of events (Inserts, Updates, Deletes) that the connefctor lags behind.",
+    ["step_id", "table", "partition_id"],
+)
+
+snapshot_and_transaction_type = [
+    "BeginTransaction",
+    "CommitTransaction",
+    "BeginSnapshot",
+    "CommitSnapshot",
+]
+
+
+class SingleStoreSource(
+    FixedPartitionedSource[dict, dict[int, dict[int, Optional[bytes]]]]
+):
     def __init__(
         self,
         host: str,
@@ -16,15 +33,7 @@ class SingleStoreSource(FixedPartitionedSource[dict, dict[int, Optional[bytes]]]
         password: str,
         database: str,
         table: str,
-        event_types: List[str] = [
-            "Insert",
-            "Update",
-            "Delete",
-            "BeginTransaction",
-            "CommitTransaction",
-            "BeginSnapshot",
-            "CommitSnapshot",
-        ],
+        include_snapshot_and_transaction_events: bool = False,
         batch_size: int = 100,
         batch_timeout: timedelta = timedelta(seconds=1),
     ):
@@ -36,7 +45,9 @@ class SingleStoreSource(FixedPartitionedSource[dict, dict[int, Optional[bytes]]]
             "database": database,
         }
         self.table = table
-        self.event_types = event_types
+        self.include_snapshot_and_transaction_events = (
+            include_snapshot_and_transaction_events
+        )
         self.batch_size = batch_size
         self.batch_timeout = batch_timeout
 
@@ -47,39 +58,54 @@ class SingleStoreSource(FixedPartitionedSource[dict, dict[int, Optional[bytes]]]
         self,
         step_id: str,
         for_part: str,
-        resume_state: Optional[dict[int, Optional[bytes]]],
-    ) -> StatefulSourcePartition[dict, dict[int, Optional[bytes]]]:
+        resume_state: Optional[dict[int, dict[int, Optional[bytes]]]],
+    ) -> StatefulSourcePartition[dict, dict[int, dict[int, Optional[bytes]]]]:
+        metric_labels = {"step_id": step_id, "table": for_part}
         return _SingleStoreSourcePartition(
             self.connection_params,
             for_part,
             resume_state,
-            self.event_types,
+            metric_labels,
+            self.include_snapshot_and_transaction_events,
             self.batch_size,
             self.batch_timeout,
         )
 
 
 class _SingleStoreSourcePartition(
-    StatefulSourcePartition[dict, dict[int, Optional[bytes]]]
+    StatefulSourcePartition[dict, dict[int, dict[int, Optional[bytes]]]]
 ):
     def __init__(
         self,
         connection_params: dict,
         table: str,
-        resume_state: Optional[dict[int, Optional[bytes]]],
-        event_types: List[str],
+        resume_state: Optional[dict[int, dict[int, Optional[bytes]]]],
+        metric_labels: dict,
+        include_snapshot_and_transaction_events: bool,
         batch_size: int,
         batch_timeout: timedelta,
     ):
         self.connection_params = connection_params
         self.table = table
-        self.event_types = event_types
+        self.metric_labels = metric_labels
+        self.include_snapshot_and_transaction_events = (
+            include_snapshot_and_transaction_events
+        )
+        self.previous_batch = []
         self.loop = asyncio.new_event_loop()
+        self.connection = self.loop.run_until_complete(
+            connect(**self.connection_params)
+        )
         self.last_offsets = {
-            i: resume_state[i] if resume_state and i in resume_state else None
+            i: resume_state[i]
+            if resume_state and i in resume_state
+            else {"count": 0, "offset": None}
             for i in range(self.loop.run_until_complete(self._get_partition_count()))
         }
         self.columns = self.loop.run_until_complete(self._describe_table())
+        self.partitions_offsets = self.loop.run_until_complete(
+            self._get_row_change_counts()
+        )
         self.batcher = batch_async(
             self._observe(),
             timeout=batch_timeout,
@@ -88,7 +114,13 @@ class _SingleStoreSourcePartition(
         )
 
     def next_batch(self) -> Iterable[dict]:
-        return next(self.batcher)
+        batch = next(self.batcher)
+        self._commit_previous_batch()
+        self._update_metrics()
+        # TODO: Why doesn't this work:
+        # self.loop.run_until_complete(self._get_row_change_counts())
+        self.previous_batch = batch
+        return batch
 
     def snapshot(self) -> dict[int, Optional[bytes]]:
         return self.last_offsets
@@ -116,7 +148,6 @@ class _SingleStoreSourcePartition(
         offsets = self._stringify_offsets()
         if offsets:
             query += f" BEGIN AT ({','.join(offsets)})"
-        self.connection = await connect(**self.connection_params)
         async with self.connection.cursor() as id_cursor:
             await id_cursor.execute("SELECT CONNECTION_ID()")
             self.connection_id = (await id_cursor.fetchone())[0]
@@ -125,36 +156,59 @@ class _SingleStoreSourcePartition(
         await self.cursor.execute(query)
         while True:
             row = await self.cursor.fetchone()
-            self.last_offsets[row[1]] = row[0]
-            if row[2] in self.event_types:
-                data = row[7:]
-                yield {
-                    "type": row[2],
-                    "data": {
-                        self.columns[i]["name"]: data[i] for i in range(len(data))
-                    },
-                }
+            data = row[7:]
+            event = {
+                "type": row[2],
+                "partition_id": row[1],
+                "offset": row[0],
+                "data": {self.columns[i]["name"]: data[i] for i in range(len(data))},
+            }
+            if self.include_snapshot_and_transaction_events:
+                yield event
+            elif row[2] in ["Insert", "Update", "Delete"]:
+                yield event
 
     def _stringify_offsets(self):
         ordered_offsets = sorted(self.last_offsets.items(), key=lambda x: x[0])
         return [
-            f"'{hexlify(offset).decode('utf-8')}'" if offset is not None else "NULL"
-            for _, offset in ordered_offsets
+            f"'{hexlify(partition['offset']).decode('utf-8')}'"
+            if partition["offset"] is not None
+            else "NULL"
+            for _, partition in ordered_offsets
         ]
 
     async def _get_partition_count(self):
-        async with connect(**self.connection_params) as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute("SHOW PARTITIONS")
-                partitions = await cursor.fetchall()
-                return len(partitions) if partitions is not None else 1
+        async with self.connection.cursor() as cursor:
+            await cursor.execute("SHOW PARTITIONS")
+            partitions = await cursor.fetchall()
+            return len(partitions) if partitions is not None else 1
 
     async def _describe_table(self):
-        async with connect(**self.connection_params) as connection:
-            async with connection.cursor() as cursor:
-                await cursor.execute(f"DESCRIBE {self.table}")
-                result = await cursor.fetchall()
-                return [
-                    {"name": row[0], "is_primary_key": row[3] == "PRI"}
-                    for row in result
-                ]
+        async with self.connection.cursor() as cursor:
+            await cursor.execute(f"DESCRIBE {self.table}")
+            result = await cursor.fetchall()
+            return [
+                {"name": row[0], "is_primary_key": row[3] == "PRI"} for row in result
+            ]
+
+    async def _get_row_change_counts(self):
+        async with self.connection.cursor(SSCursor) as cursor:
+            await cursor.execute(
+                f"SELECT partition, total_changes FROM information_schema.mv_collected_row_change_counts WHERE table_name = '{self.table}'"
+            )
+            rows = await cursor.fetchall()
+            return [(row[0], row[1]) for row in rows]
+
+    def _update_metrics(self):
+        for partition_id, offset in self.partitions_offsets:
+            processed = self.last_offsets[partition_id]["count"]
+            lag = offset - processed
+            OFFSET_LAG_GAUGE.labels(
+                **self.metric_labels, partition_id=partition_id
+            ).set(lag)
+
+    def _commit_previous_batch(self):
+        for row in self.previous_batch:
+            self.last_offsets[row["partition_id"]]["offset"] = row["offset"]
+            if row["type"] in ["Insert", "Update", "Delete"]:
+                self.last_offsets[row["partition_id"]]["count"] += 1
