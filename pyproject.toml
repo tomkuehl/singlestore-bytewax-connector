@@ -25,7 +25,7 @@ classifiers = [
   "Programming Language :: Python :: 3 :: Only",
 ]
 dependencies = [
-  "bytewax==0.20.1",
+  "bytewax==0.21.0",
   "asyncmy==0.2.9",
   "asyncio==3.4.3"
 ]
